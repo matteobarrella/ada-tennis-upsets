@@ -1,0 +1,11 @@
+# notebooks and python
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+# environments and editors
+.venv/
+venv/
+.vscode/
+.idea/
+# macOS
+.DS_Store
