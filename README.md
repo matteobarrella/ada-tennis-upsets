@@ -3,7 +3,7 @@
 Semester project for Advanced Data Analytics (HEC Lausanne, autumn 2026).
 Author: Matteo Barrella. Proposal approved by the teaching assistant on 1 November 2026.
 
-**Status: work in progress.** Stages 1 to 3 are done (data, cleaning and features, models).
+**Status: work in progress.** Stages 1 to 4 are done (data, cleaning and features, models, figures). Paper and recording still to come.
 Figures, paper and recording are still to be added.
 
 ## Research question
@@ -27,15 +27,17 @@ code/
   01_get_data.py      checks the data files, downloads missing ones from the pinned mirror commit
   02_clean.ipynb      cleaning, features built from past matches only, leakage checks
   03_models.ipynb     baseline, logistic regression, k-NN, gradient boosting, evaluation
+  04_figures.ipynb    all figures and the results table of the paper, from the saved results
   helpers.py          code shared by the notebooks
 data/
   atp_matches_YYYY.csv    raw files, 2000-2024
   processed/              table written by 02_clean.ipynb
   SOURCE.md
 results/                  tables written by 03_models.ipynb (metrics, CV results, predictions)
+figures/                  figures (png and pdf) and results table written by 04_figures.ipynb
 ```
 
-To be added: `04_figures.ipynb`, `figures/`, `paper.pdf`, `recording.mp4` (or a link).
+To be added: `paper.pdf`, `recording.mp4` (or a link).
 
 ## How to reproduce
 
@@ -47,11 +49,14 @@ python code/01_get_data.py
 cd code
 jupyter nbconvert --to notebook --execute --inplace 02_clean.ipynb
 jupyter nbconvert --to notebook --execute --inplace 03_models.ipynb
+jupyter nbconvert --to notebook --execute --inplace 04_figures.ipynb
 ```
 
 Each notebook runs top to bottom in a fresh kernel from the folder `code/`.
-Running time: `02_clean.ipynb` under one minute, `03_models.ipynb` about 6 minutes.
+Running time: `02_clean.ipynb` under one minute, `03_models.ipynb` about 6 minutes, `04_figures.ipynb` a few seconds.
 Nothing beyond the course workspace (Nuvolos) is needed.
+
+The three libraries that affect the numbers are pinned in `requirements.txt` to the versions installed on Nuvolos (pandas 2.3.3, NumPy 2.3.5, scikit-learn 1.8.0). With other versions the gradient boosting results move in the third decimal (checked: the AUC of the best model differs by about 0.001), and all saved results match a fresh run on Nuvolos.
 
 Note for Nuvolos: its notebook kernels start in `/files`, not in the notebook's folder. Run
 `%cd` into the `code/` folder in a first cell (or start the notebooks from a terminal in
@@ -71,6 +76,6 @@ and a truncation test that rebuilds the features on data cut at a match. Both ar
 * Libraries: pandas, NumPy, scikit-learn, matplotlib, Jupyter (used as intended, no attribution needed).
 * Data: Jeff Sackmann, CC BY-NC-SA 4.0 (see above).
 * Generative AI: Claude (Anthropic) was used to write the first version of `helpers.py`,
-  `01_get_data.py`, `02_clean.ipynb` and `03_models.ipynb`, and to draft this README. The author reviewed the code.
+  `01_get_data.py`, `02_clean.ipynb`, `03_models.ipynb` and `04_figures.ipynb`, and to draft this README. The author reviewed the code.
   This list is the basis for the declaration in the paper's appendix and is kept up to date.
 * Code from the course: none reused so far.
