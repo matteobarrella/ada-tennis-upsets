@@ -37,6 +37,10 @@ FORM_WINDOW = 10      # form = win rate over the player's last 10 matches
 SURFACE_SMOOTH = 4    # surface record shrunk towards 50% with weight of 4 matches
 DAYS_CAP = 365        # days since last match capped at one year (heavy right tail)
 
+# Elo rating (overall and per surface), updated match by match
+ELO_START = 1500.0
+ELO_K_SCALE, ELO_K_SHIFT, ELO_K_EXP = 250.0, 5.0, 0.4   # K = 250 / (n + 5) ** 0.4
+
 
 # ----------------------------------------------------------------------------
 # Loading and preparation
@@ -87,14 +91,25 @@ def prepare(raw: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # History features (one chronological pass, state read before update)
 # ----------------------------------------------------------------------------
-HIST_COLS = ["days", "form", "surf", "n_prior"]
+HIST_COLS = ["days", "form", "surf", "n_prior", "elo", "selo"]
+
+
+def _elo_k(n_matches: int) -> float:
+    """Learning rate of the Elo update: large for players with few matches."""
+    return ELO_K_SCALE / (n_matches + ELO_K_SHIFT) ** ELO_K_EXP
+
+
+def _elo_expected(r_a: float, r_b: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** ((r_b - r_a) / 400.0))
 
 
 def add_history_features(df: pd.DataFrame) -> pd.DataFrame:
     """For winner (w_) and loser (l_) of each match compute, using earlier
     matches only: days since last match, form (win rate over last 10), win rate
     on the match surface (smoothed), number of earlier matches; plus head-to-head
-    wins of each side against the other.
+    wins of each side against the other. It also tracks an Elo rating (overall,
+    `elo`) and an Elo rating per surface (`selo`), both read before the match and
+    updated after it.
 
     `df` must come from `prepare`. Matches flagged not played neither get
     features nor enter anyone's history. Retirements do enter the history.
@@ -109,6 +124,9 @@ def add_history_features(df: pd.DataFrame) -> pd.DataFrame:
     n_played = defaultdict(int)
     surf_rec = defaultdict(lambda: [0, 0])     # (player, surface) -> [wins, matches]
     h2h = defaultdict(int)                      # (a, b) -> wins of a over b
+    elo = defaultdict(lambda: ELO_START)        # player -> rating
+    selo = defaultdict(lambda: ELO_START)       # (player, surface) -> rating
+    selo_n = defaultdict(int)                   # (player, surface) -> matches played
 
     winner, loser = df["winner_id"].to_numpy(), df["loser_id"].to_numpy()
     surface = df["surface"].to_numpy(dtype=object)
@@ -131,10 +149,25 @@ def add_history_features(df: pd.DataFrame) -> pd.DataFrame:
                 wins, tot = surf_rec[(p, s)]
                 out[f"{side}_surf"][i] = (wins + SURFACE_SMOOTH * 0.5) / (tot + SURFACE_SMOOTH)
             out[f"{side}_n_prior"][i] = n_played[p]
+            out[f"{side}_elo"][i] = elo[p]
+            out[f"{side}_selo"][i] = selo[(p, s)] if has_surface else elo[p]
         out["h2h_w"][i] = h2h[(w, l)]
         out["h2h_l"][i] = h2h[(l, w)]
 
         # 2) only now update the state with this match
+        # Elo: both updates use the ratings read above (before the match)
+        e_w = _elo_expected(elo[w], elo[l])
+        k_w, k_l = _elo_k(n_played[w]), _elo_k(n_played[l])
+        elo_w_new = elo[w] + k_w * (1.0 - e_w)
+        elo_l_new = elo[l] - k_l * (1.0 - e_w)
+        if has_surface:
+            es_w = _elo_expected(selo[(w, s)], selo[(l, s)])
+            ks_w, ks_l = _elo_k(selo_n[(w, s)]), _elo_k(selo_n[(l, s)])
+            selo[(w, s)] += ks_w * (1.0 - es_w)
+            selo[(l, s)] -= ks_l * (1.0 - es_w)
+            selo_n[(w, s)] += 1
+            selo_n[(l, s)] += 1
+        elo[w], elo[l] = elo_w_new, elo_l_new
         for p, won in ((w, 1), (l, 0)):
             last_date[p] = d
             recent[p].append(won)
@@ -201,6 +234,8 @@ def build_model_table(featured: pd.DataFrame) -> pd.DataFrame:
     t["surf_diff"] = t["fav_surf"] - t["und_surf"]
     t["h2h_diff"] = t["fav_h2h"] - t["und_h2h"]
     t["h2h_total"] = t["fav_h2h"] + t["und_h2h"]
+    t["elo_diff"] = t["fav_elo"] - t["und_elo"]      # favourite minus underdog
+    t["selo_diff"] = t["fav_selo"] - t["und_selo"]
 
     t["upset"] = (~fav_w).astype(int)
     return t.reset_index(drop=True)
@@ -243,12 +278,42 @@ def _brute_force(prep: pd.DataFrame, pos: int, player, opponent, surface) -> dic
     return res
 
 
+def _elo_reference(prep: pd.DataFrame) -> dict:
+    """Second, independent implementation of the Elo ratings (plain loop over
+    match tuples, no shared code with add_history_features). Returns
+    {pos: (elo_w, elo_l, selo_w, selo_l)} as read before each match."""
+    rating, srating, count, scount = {}, {}, {}, {}
+    ref = {}
+    for r in prep.itertuples(index=False):
+        if not r.played:
+            continue
+        w, l, s = r.winner_id, r.loser_id, r.surface
+        surf = isinstance(s, str)
+        rw, rl = rating.get(w, 1500.0), rating.get(l, 1500.0)
+        sw = srating.get((w, s), 1500.0) if surf else rw
+        sl = srating.get((l, s), 1500.0) if surf else rl
+        ref[r.pos] = (rw, rl, sw, sl)
+        pw = 1 / (1 + 10 ** ((rl - rw) / 400))
+        kw = 250 / (count.get(w, 0) + 5) ** 0.4
+        kl = 250 / (count.get(l, 0) + 5) ** 0.4
+        rating[w], rating[l] = rw + kw * (1 - pw), rl - kl * (1 - pw)
+        count[w], count[l] = count.get(w, 0) + 1, count.get(l, 0) + 1
+        if surf:
+            pws = 1 / (1 + 10 ** ((sl - sw) / 400))
+            ksw = 250 / (scount.get((w, s), 0) + 5) ** 0.4
+            ksl = 250 / (scount.get((l, s), 0) + 5) ** 0.4
+            srating[(w, s)], srating[(l, s)] = sw + ksw * (1 - pws), sl - ksl * (1 - pws)
+            scount[(w, s)], scount[(l, s)] = scount.get((w, s), 0) + 1, scount.get((l, s), 0) + 1
+    return ref
+
+
 def check_no_lookahead(prep: pd.DataFrame, table: pd.DataFrame, n_samples: int = 300,
                        n_truncations: int = 5, seed: int = 0) -> dict:
     """Two independent checks, raising AssertionError on any mismatch.
 
     1. Brute force: for a random sample of matches, recompute both players'
        features by filtering to strictly earlier matches and compare with the table.
+       The Elo ratings are compared with a second, independent implementation.
     2. Truncation: cut the data right after a random match, rebuild the features
        from scratch and compare that match's features with the full run. If any
        feature used later matches, the values would differ.
@@ -272,6 +337,15 @@ def check_no_lookahead(prep: pd.DataFrame, table: pd.DataFrame, n_samples: int =
             assert row.__getattribute__(f"{who}_h2h") == exp["h2h"], (
                 f"{who}_h2h mismatch at pos {row.pos}")
 
+    # 1b) Elo against an independent second implementation (all sampled matches)
+    ref = _elo_reference(prep)
+    for row in sample.itertuples(index=False):
+        rw, rl, sw, sl = ref[row.pos]
+        fav_is_w = row.fav_id == prep.at[row.pos, "winner_id"]
+        exp = (rw, rl, sw, sl) if fav_is_w else (rl, rw, sl, sw)
+        got = (row.fav_elo, row.und_elo, row.fav_selo, row.und_selo)
+        assert np.allclose(got, exp), f"Elo mismatch at pos {row.pos}: {got} vs {exp}"
+
     # 2) truncation invariance
     full = add_history_features(prep)
     positions = rng.choice(prep.index[prep["played"]].to_numpy(), size=n_truncations, replace=False)
@@ -282,3 +356,95 @@ def check_no_lookahead(prep: pd.DataFrame, table: pd.DataFrame, n_samples: int =
         assert np.allclose(a, b, equal_nan=True), f"Truncation changed features at pos {p}"
 
     return {"brute_force_matches": len(sample), "truncation_points": len(positions)}
+
+
+# ----------------------------------------------------------------------------
+# Modelling (used by notebook 03)
+# ----------------------------------------------------------------------------
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (brier_score_loss, log_loss,
+                             precision_recall_fscore_support, roc_auc_score)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+RANK_FEATURES = ["log_rank_ratio", "log_points_ratio"]
+CONTEXT_NUM = ["best_of"]
+CONTEXT_CAT = ["surface", "round", "tourney_level"]
+HISTORY_FEATURES = ["fav_days", "und_days", "fav_form", "und_form", "form_diff",
+                    "fav_surf", "und_surf", "surf_diff", "h2h_diff", "h2h_total"]
+
+# name -> (numeric columns, categorical columns)
+ELO_FEATURES = ["elo_diff", "selo_diff"]
+
+FEATURE_SETS = {
+    "rank": (RANK_FEATURES, []),
+    "rank+context": (RANK_FEATURES + CONTEXT_NUM, CONTEXT_CAT),
+    "rank+elo": (RANK_FEATURES + ELO_FEATURES, []),
+    "all": (RANK_FEATURES + CONTEXT_NUM + HISTORY_FEATURES, CONTEXT_CAT),
+    "all+elo": (RANK_FEATURES + CONTEXT_NUM + HISTORY_FEATURES + ELO_FEATURES, CONTEXT_CAT),
+}
+
+# groups of columns used for the permutation importance
+FEATURE_GROUPS = {
+    "ranking gap": RANK_FEATURES,
+    "surface, round, level, best of": CONTEXT_NUM + CONTEXT_CAT,
+    "days since last match": ["fav_days", "und_days"],
+    "recent form": ["fav_form", "und_form", "form_diff"],
+    "surface record": ["fav_surf", "und_surf", "surf_diff"],
+    "head-to-head": ["h2h_diff", "h2h_total"],
+    "Elo ratings": ELO_FEATURES,
+}
+
+
+def make_model(kind: str, **params):
+    """Return an unfitted pipeline. kind is 'logreg', 'knn' or 'gboost'."""
+    num, cat = params.pop("num"), params.pop("cat")
+    scaled = kind in ("logreg", "knn")
+    if scaled:
+        num_tf = Pipeline([("imp", SimpleImputer(strategy="median", add_indicator=True)),
+                           ("sc", StandardScaler())])
+    else:
+        num_tf = "passthrough"          # gradient boosting handles NaN natively
+    parts = [("num", num_tf, num)]
+    if cat:
+        cat_tf = Pipeline([
+            ("imp", SimpleImputer(strategy="constant", fill_value="missing")),
+            ("oh", OneHotEncoder(handle_unknown="ignore", min_frequency=50,
+                                 sparse_output=False))])
+        parts.append(("cat", cat_tf, cat))
+    pre = ColumnTransformer(parts)
+    if kind == "logreg":
+        est = LogisticRegression(C=params.get("C", 1.0), max_iter=2000)
+    elif kind == "knn":
+        est = KNeighborsClassifier(n_neighbors=params.get("k", 100), n_jobs=-1)
+    elif kind == "gboost":
+        est = HistGradientBoostingClassifier(
+            learning_rate=params.get("lr", 0.05), max_iter=params.get("n", 200),
+            max_depth=params.get("depth", 3), min_samples_leaf=100,
+            l2_regularization=1.0, random_state=0)
+    else:
+        raise ValueError(kind)
+    return Pipeline([("pre", pre), ("est", est)])
+
+
+def scores(y, p, threshold: float) -> dict:
+    """Metrics for the upset class (label 1) given predicted probabilities p."""
+    y = np.asarray(y)
+    pred = (p >= threshold).astype(int)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y, pred, average="binary", zero_division=0)
+    return {"auc": roc_auc_score(y, p), "log_loss": log_loss(y, p),
+            "brier": brier_score_loss(y, p), "accuracy": float((pred == y).mean()),
+            "precision": prec, "recall": rec, "f1": f1}
+
+
+def best_f1_threshold(y, p) -> float:
+    """Probability threshold that maximises F1 for the upset class."""
+    grid = np.arange(0.10, 0.70, 0.01)
+    f1s = [precision_recall_fscore_support(y, (p >= t).astype(int), average="binary",
+                                           zero_division=0)[2] for t in grid]
+    return float(grid[int(np.argmax(f1s))])

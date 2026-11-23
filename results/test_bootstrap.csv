@@ -1,0 +1,5 @@
+,difference
+AUC gboost - logreg (all+elo),"+0.0015  95% CI [-0.0012, +0.0041]"
+AUC Elo effect on rank only (logreg),"+0.0362  95% CI [+0.0269, +0.0455]"
+AUC Elo effect on all features (logreg),"+0.0084  95% CI [+0.0033, +0.0131]"
+AUC all+elo gboost - rank logreg,"+0.0399  95% CI [+0.0302, +0.0494]"
